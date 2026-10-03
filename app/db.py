@@ -21,6 +21,14 @@
   版本与点集登记为最早可追溯基线（cause=baseline），不推造更早轨迹。穿越查询可按任一已保留
   版本复现当时点集。
 
+通行许可
+--------
+- ``permit_revisions`` 为只追加、不可改的许可历史：每次真实登记（action=register）或
+  撤销（action=revoke）在写事务内原子分配一个**全局许可修订号**（与区域修订号、
+  车次轨迹版本互相独立）；同 ID 同内容重传幂等不产生新行，异内容冲突、撤销后 ID 不得重用。
+- 截至许可修订号 R，每个许可 ID 取其 ``revision <= R`` 的最后一行为当时状态
+  （register=有效，revoke=已撤销）；复核按该车次该区取有效许可时段并集。
+
 并发
 ----
 - 服务进程内以一把可重入锁串行化对共享连接的访问；写事务使用 ``BEGIN IMMEDIATE``，
@@ -129,6 +137,26 @@ CREATE TABLE IF NOT EXISTS trip_point_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_trip_point_versions_lookup
     ON trip_point_versions(trip_id, version, ts_epoch, point_id);
+
+-- 通行许可不可变历史：每次真实登记或撤销追加一行，只追加、不可改、不删除。
+-- revision 为全局许可修订号（与区域修订号、车次轨迹版本互相独立），
+-- 在登记/撤销事务内由 SQLite AUTOINCREMENT 原子分配；纯幂等重传不产生行。
+-- 撤销行保留被撤销许可的完整内容（车次/危险区/时段），历史自足可查。
+CREATE TABLE IF NOT EXISTS permit_revisions (
+    revision      INTEGER PRIMARY KEY AUTOINCREMENT,  -- 全局许可修订号
+    permit_id     TEXT NOT NULL,
+    action        TEXT NOT NULL,          -- register | revoke
+    trip_id       TEXT NOT NULL,
+    zone_id       TEXT NOT NULL,
+    start_epoch   REAL NOT NULL,
+    end_epoch     REAL NOT NULL,
+    start_iso     TEXT NOT NULL,
+    end_iso       TEXT NOT NULL,
+    base_revision INTEGER,                -- 撤销时提交的所见许可修订号；登记为 NULL
+    registered_at TEXT NOT NULL           -- 本次登记/撤销时间
+);
+CREATE INDEX IF NOT EXISTS idx_permit_revisions_id_rev
+    ON permit_revisions(permit_id, revision);
 """
 
 _LEGACY_TABLES = ("zones", "zone_windows")
@@ -650,6 +678,106 @@ class Database:
             )
         )
 
+    # ----- 通行许可 ----------------------------------------------------------
+
+    @staticmethod
+    def _current_permit_revision(conn: sqlite3.Connection) -> int:
+        """在给定连接/读视图内取当前全局许可修订号（尚无任何许可登记/撤销时为 0）。"""
+        cur = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) AS r FROM permit_revisions"
+        )
+        return int(cur.fetchone()["r"])
+
+    def current_permit_revision(self) -> int:
+        """当前全局许可修订号（尚无任何许可登记/撤销时为 0）。"""
+        with self._lock:
+            return self._current_permit_revision(self._conn)
+
+    @staticmethod
+    def insert_permit_revision(
+        conn: sqlite3.Connection,
+        permit_id: str,
+        action: str,
+        trip_id: str,
+        zone_id: str,
+        start_epoch: float,
+        end_epoch: float,
+        start_iso: str,
+        end_iso: str,
+        base_revision: Optional[int],
+        registered_iso: str,
+    ) -> int:
+        """在给定写事务内追加一条不可变许可历史记录，返回分配的全局许可修订号。"""
+        cur = conn.execute(
+            "INSERT INTO permit_revisions"
+            "(permit_id, action, trip_id, zone_id, start_epoch, end_epoch, "
+            " start_iso, end_iso, base_revision, registered_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                permit_id,
+                action,
+                trip_id,
+                zone_id,
+                start_epoch,
+                end_epoch,
+                start_iso,
+                end_iso,
+                base_revision,
+                registered_iso,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    @staticmethod
+    def _latest_permit_row(conn: sqlite3.Connection, permit_id: str) -> Optional[sqlite3.Row]:
+        cur = conn.execute(
+            "SELECT * FROM permit_revisions WHERE permit_id = ? "
+            "ORDER BY revision DESC LIMIT 1",
+            (permit_id,),
+        )
+        return cur.fetchone()
+
+    @staticmethod
+    def _permit_row_at(
+        conn: sqlite3.Connection, permit_id: str, revision: int
+    ) -> Optional[sqlite3.Row]:
+        """截至许可修订号 R 该许可 ID 的最后状态；当时尚未登记为 None。"""
+        cur = conn.execute(
+            "SELECT * FROM permit_revisions WHERE permit_id = ? AND revision <= ? "
+            "ORDER BY revision DESC LIMIT 1",
+            (permit_id, revision),
+        )
+        return cur.fetchone()
+
+    @staticmethod
+    def _list_active_permit_rows_for(
+        conn: sqlite3.Connection, trip_id: str, zone_id: str, revision: int
+    ) -> List[sqlite3.Row]:
+        """截至许可修订号 R、该车次该区仍有效（最后状态为登记而非撤销）的许可行。"""
+        return list(
+            conn.execute(
+                "SELECT pr.* FROM permit_revisions pr "
+                "JOIN (SELECT permit_id, MAX(revision) AS mr FROM permit_revisions "
+                "      WHERE revision <= ? GROUP BY permit_id) m "
+                "ON pr.permit_id = m.permit_id AND pr.revision = m.mr "
+                "WHERE pr.action = 'register' AND pr.trip_id = ? AND pr.zone_id = ? "
+                "ORDER BY pr.start_epoch, pr.permit_id",
+                (revision, trip_id, zone_id),
+            )
+        )
+
+    def list_permit_revision_rows(self, limit: int = 500) -> List[sqlite3.Row]:
+        """全局许可修订流水（按修订号倒序）。"""
+        with self._lock:
+            return list(
+                self._conn.execute(
+                    "SELECT revision, permit_id, action, trip_id, zone_id, "
+                    "start_iso, end_iso, base_revision, registered_at "
+                    "FROM permit_revisions ORDER BY revision DESC LIMIT ?",
+                    (int(limit),),
+                )
+            )
+
     def clear_all_for_tests(self) -> None:
         """测试专用：清空业务数据并重置修订号序列。"""
         with self.transaction() as conn:
@@ -660,5 +788,7 @@ class Database:
             conn.execute("DELETE FROM point_corrections")
             conn.execute("DELETE FROM trip_version_log")
             conn.execute("DELETE FROM trip_point_versions")
+            conn.execute("DELETE FROM permit_revisions")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='zone_revisions'")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='point_corrections'")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='permit_revisions'")

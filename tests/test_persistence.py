@@ -93,3 +93,84 @@ def test_corrections_survive_database_reopen():
             {"points": [{"point_id": "q3", "ts": "2026-09-30T12:00:00Z", "x": 1, "y": 1}]},
         )
     db2.close()
+
+
+def test_permits_survive_database_reopen():
+    """许可登记/撤销历史与许可修订号在重开数据库后仍可查询、可复现。"""
+    settings = get_settings()
+    db1 = Database(settings)
+    svc1 = AuditService(db1)
+    svc1.register_zone(
+        {
+            "zone_id": "persist-pz",
+            "exterior": SQUARE,
+            "holes": [],
+            "windows": [{"start": "2026-09-30T00:00:00Z", "end": "2026-10-01T00:00:00Z"}],
+        }
+    )
+    svc1.submit_points(
+        "persist-pt",
+        {
+            "points": [
+                {"point_id": "q1", "ts": "2026-09-30T10:00:00Z", "x": -50, "y": 50},
+                {"point_id": "q2", "ts": "2026-09-30T10:01:20Z", "x": 150, "y": 50},
+            ]
+        },
+    )
+    svc1.register_permit(
+        {
+            "permit_id": "PP-1",
+            "trip_id": "persist-pt",
+            "zone_id": "persist-pz",
+            "start": "2026-09-30T09:00:00Z",
+            "end": "2026-09-30T11:00:00Z",
+        }
+    )
+    svc1.revoke_permit("PP-1", {"base_revision": 1})
+    db1.close()
+
+    # 模拟进程重启：用同一文件新建连接
+    db2 = Database(settings)
+    svc2 = AuditService(db2)
+    assert svc2.list_permit_revisions()["current_permit_revision"] == 2
+    permit = svc2.get_permit("PP-1")
+    assert permit["status"] == "revoked"
+    assert svc2.get_permit("PP-1", 1)["status"] == "active"
+
+    # 撤销后最新复核：全程无许可；按许可修订号 1 复现：全程有许可
+    latest = svc2.query_permit_review(
+        "persist-pt",
+        {
+            "zone_ids": ["persist-pz"],
+            "since": "2026-09-30T09:00:00Z",
+            "until": "2026-09-30T11:00:00Z",
+        },
+    )
+    assert latest["permit_revision"] == 2
+    assert latest["zones"][0]["unpermitted_total_sec"] == 40.0
+    repro = svc2.query_permit_review(
+        "persist-pt",
+        {
+            "zone_ids": ["persist-pz"],
+            "since": "2026-09-30T09:00:00Z",
+            "until": "2026-09-30T11:00:00Z",
+            "permit_revision": 1,
+        },
+    )
+    assert repro["zones"][0]["unpermitted_total_sec"] == 0
+
+    # 已撤销许可 ID 重开后仍禁止重用
+    import pytest
+    from app.service import ConflictError
+
+    with pytest.raises(ConflictError):
+        svc2.register_permit(
+            {
+                "permit_id": "PP-1",
+                "trip_id": "persist-pt",
+                "zone_id": "persist-pz",
+                "start": "2026-09-30T09:00:00Z",
+                "end": "2026-09-30T11:00:00Z",
+            }
+        )
+    db2.close()

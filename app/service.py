@@ -1,4 +1,4 @@
-"""业务服务：危险区登记（全局修订号）、轨迹点批量提交、穿越审计计算。"""
+"""业务服务：危险区登记（全局修订号）、轨迹点批量提交、穿越审计计算、通行许可登记/撤销/复核。"""
 from __future__ import annotations
 
 import bisect
@@ -45,6 +45,50 @@ def _validate_revision_param(raw: Any) -> int:
     if value < 1:
         raise ValidationError(f"revision 必须是正整数（>=1），收到: {value}")
     return value
+
+
+def _validate_permit_revision_param(raw: Any) -> int:
+    """校验许可修订号：必须是 >=1 的整数。"""
+    if isinstance(raw, bool):
+        raise ValidationError(f"permit_revision 必须是正整数，收到: {raw!r}")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        text = str(raw).strip()
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            raise ValidationError(f"permit_revision 必须是正整数，收到: {raw!r}")
+    if value < 1:
+        raise ValidationError(f"permit_revision 必须是正整数（>=1），收到: {value}")
+    return value
+
+
+def _subtract_time_intervals(
+    base: List[Tuple[float, float]],
+    cuts: List[Tuple[float, float]],
+    eps: float = 1e-6,
+) -> List[Tuple[float, float]]:
+    """从互不相交的半开区间 base 中减去 cuts（已合并的时段并集），返回剩余区间。
+
+    时间域容差与穿越计算的区间合并一致（1e-6 秒），吸收浮点解析误差。
+    """
+    result: List[Tuple[float, float]] = []
+    for a, b in base:
+        pieces = [(a, b)]
+        for c, d in cuts:
+            next_pieces: List[Tuple[float, float]] = []
+            for pa, pb in pieces:
+                if d <= pa + eps or c >= pb - eps:
+                    next_pieces.append((pa, pb))
+                    continue
+                if c > pa:
+                    next_pieces.append((pa, min(pb, c)))
+                if d < pb:
+                    next_pieces.append((max(pa, d), pb))
+            pieces = [(p, q) for p, q in next_pieces if q - p > eps]
+        result.extend(pieces)
+    return result
 
 
 def _row_to_zone(row: Any, *, include_revision: bool = True) -> Dict[str, Any]:
@@ -1651,3 +1695,389 @@ class AuditService:
             pa["x"] + (pb["x"] - pa["x"]) * ratio,
             pa["y"] + (pb["y"] - pa["y"]) * ratio,
         )
+
+    # ------------------------------------------------------------------
+    # 危险区通行许可（登记 / 撤销 / 历史 / 复核）
+    # ------------------------------------------------------------------
+
+    def register_permit(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """登记通行许可：许可 ID、车次、危险区与带时区 UTC 半开时段。
+
+        - 登记时危险区须存在（按最新配置），车次可尚无轨迹；
+        - 同 ID 同内容重传幂等（不产生新许可修订号），异内容冲突（409）；
+        - 已撤销的许可 ID 不得重用（409）；
+        - 每次真实登记在单事务内原子分配全局递增许可修订号并保留不可改历史。
+        """
+        permit_id = payload.get("permit_id")
+        if not isinstance(permit_id, str) or not permit_id.strip():
+            raise ValidationError("permit_id 必须是非空字符串")
+        permit_id = permit_id.strip()
+
+        trip_id = payload.get("trip_id")
+        if not isinstance(trip_id, str) or not trip_id.strip():
+            raise ValidationError("trip_id 必须是非空字符串")
+        trip_id = trip_id.strip()
+
+        zone_id = payload.get("zone_id")
+        if not isinstance(zone_id, str) or not zone_id.strip():
+            raise ValidationError("zone_id 必须是非空字符串")
+        zone_id = zone_id.strip()
+
+        try:
+            start = parse_utc(payload.get("start"), field="start")
+            end = parse_utc(payload.get("end"), field="end")
+            validate_window(start, end)
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        start_epoch, end_epoch = start.timestamp(), end.timestamp()
+
+        now_iso = _iso_z(datetime.now(timezone.utc))
+        with self.db.transaction() as conn:
+            # 登记时危险区须存在（按最新配置核对）；车次可尚无轨迹，登记时不做要求
+            if self.db._latest_zone_row(conn, zone_id) is None:
+                raise NotFoundError(f"危险区不存在: {zone_id}")
+
+            existing = self.db._latest_permit_row(conn, permit_id)
+            if existing is not None:
+                if existing["action"] == "revoke":
+                    raise ConflictError(
+                        f"许可 ID 已撤销，不得重用: {permit_id!r}；"
+                        "如确需新许可请使用新的 permit_id"
+                    )
+                same = (
+                    existing["trip_id"] == trip_id
+                    and existing["zone_id"] == zone_id
+                    and existing["start_epoch"] == start_epoch
+                    and existing["end_epoch"] == end_epoch
+                )
+                if same:
+                    # 同 ID 同内容重传：幂等，不产生新许可修订号
+                    return {
+                        "permit_id": permit_id,
+                        "trip_id": trip_id,
+                        "zone_id": zone_id,
+                        "start": existing["start_iso"],
+                        "end": existing["end_iso"],
+                        "revision": int(existing["revision"]),
+                        "permit_revision": self.db._current_permit_revision(conn),
+                        "status": "idempotent",
+                    }
+                raise ConflictError(
+                    f"permit_id={permit_id!r} 已存在且内容不同："
+                    f"已存 (trip_id={existing['trip_id']!r}, zone_id={existing['zone_id']!r}, "
+                    f"start={existing['start_iso']}, end={existing['end_iso']})，"
+                    f"新传 (trip_id={trip_id!r}, zone_id={zone_id!r}, "
+                    f"start={_iso_z(start)}, end={_iso_z(end)})"
+                )
+
+            revision = self.db.insert_permit_revision(
+                conn,
+                permit_id,
+                "register",
+                trip_id,
+                zone_id,
+                start_epoch,
+                end_epoch,
+                _iso_z(start),
+                _iso_z(end),
+                None,
+                now_iso,
+            )
+
+        return {
+            "permit_id": permit_id,
+            "trip_id": trip_id,
+            "zone_id": zone_id,
+            "start": _iso_z(start),
+            "end": _iso_z(end),
+            "revision": revision,
+            "permit_revision": revision,
+            "status": "created",
+        }
+
+    def revoke_permit(self, permit_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """撤销通行许可：须提交所见全局许可修订号（乐观并发）。
+
+        - 许可不存在（从未登记）：404；
+        - 所见修订号与当前全局许可修订号不一致：按过期整批拒绝（409）；
+        - 已撤销的许可再次撤销：重复撤销拒绝（409）；
+        - 每次真实撤销在单事务内原子分配全局递增许可修订号并保留不可改历史；
+          撤销后该许可 ID 不得再登记重用。
+        """
+        if not isinstance(permit_id, str) or not permit_id.strip():
+            raise ValidationError("permit_id 必须是非空字符串")
+        permit_id = permit_id.strip()
+
+        base_revision = payload.get("base_revision")
+        if (
+            isinstance(base_revision, bool)
+            or not isinstance(base_revision, int)
+            or base_revision < 1
+        ):
+            raise ValidationError(
+                f"base_revision 必须是 >=1 的整数，收到: {base_revision!r}"
+            )
+
+        now_iso = _iso_z(datetime.now(timezone.utc))
+        with self.db.transaction() as conn:
+            row = self.db._latest_permit_row(conn, permit_id)
+            if row is None:
+                raise NotFoundError(f"许可不存在: {permit_id}")
+            head = self.db._current_permit_revision(conn)
+            if base_revision != head:
+                raise ConflictError(
+                    f"许可修订号过期: 撤销基于许可修订号 {base_revision}，"
+                    f"当前许可修订号为 {head}；请读取当前许可状态后重新提交撤销"
+                )
+            if row["action"] == "revoke":
+                raise ConflictError(f"许可已撤销，重复撤销拒绝: {permit_id!r}")
+
+            # 撤销行保留被撤销许可的完整内容，历史自足可查
+            revision = self.db.insert_permit_revision(
+                conn,
+                permit_id,
+                "revoke",
+                row["trip_id"],
+                row["zone_id"],
+                row["start_epoch"],
+                row["end_epoch"],
+                row["start_iso"],
+                row["end_iso"],
+                base_revision,
+                now_iso,
+            )
+
+        return {
+            "permit_id": permit_id,
+            "trip_id": row["trip_id"],
+            "zone_id": row["zone_id"],
+            "start": row["start_iso"],
+            "end": row["end_iso"],
+            "revision": revision,
+            "permit_revision": revision,
+            "status": "revoked",
+            "base_revision": base_revision,
+        }
+
+    @staticmethod
+    def _permit_body(row: Any) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "permit_id": row["permit_id"],
+            "trip_id": row["trip_id"],
+            "zone_id": row["zone_id"],
+            "start": row["start_iso"],
+            "end": row["end_iso"],
+            "status": "active" if row["action"] == "register" else "revoked",
+            "revision": int(row["revision"]),
+            "registered_at": row["registered_at"],
+        }
+        if row["action"] == "revoke":
+            body["base_revision"] = (
+                None if row["base_revision"] is None else int(row["base_revision"])
+            )
+        return body
+
+    def get_permit(
+        self, permit_id: str, permit_revision_raw: Any = None
+    ) -> Optional[Dict[str, Any]]:
+        """查询许可当前状态；指定许可修订号时取截至该号的最后状态。许可从未登记返回 None。"""
+        with self.db.read_view() as conn:
+            if permit_revision_raw is None:
+                row = self.db._latest_permit_row(conn, permit_id)
+                if row is None:
+                    return None
+            else:
+                permit_revision = _validate_permit_revision_param(permit_revision_raw)
+                head = self.db._current_permit_revision(conn)
+                if permit_revision > head:
+                    raise NotFoundError(
+                        f"许可修订号 {permit_revision} 超出当前范围："
+                        f"当前最新许可修订号为 {head}"
+                        + ("（尚无任何许可登记）" if head == 0 else "")
+                    )
+                row = self.db._permit_row_at(conn, permit_id, permit_revision)
+                if row is None:
+                    raise NotFoundError(
+                        f"许可修订号 {permit_revision} 时许可尚未登记: {permit_id}"
+                    )
+        return self._permit_body(row)
+
+    def list_permit_revisions(self, limit: int = 500) -> Dict[str, Any]:
+        """全局许可修订流水（按修订号倒序，含当前最新许可修订号）。"""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 10000:
+            raise ValidationError("limit 必须是 1..10000 的整数")
+        rows = self.db.list_permit_revision_rows(limit=limit)
+        return {
+            "current_permit_revision": self.db.current_permit_revision(),
+            "revisions": [
+                {
+                    "revision": int(r["revision"]),
+                    "permit_id": r["permit_id"],
+                    "action": r["action"],
+                    "trip_id": r["trip_id"],
+                    "zone_id": r["zone_id"],
+                    "start": r["start_iso"],
+                    "end": r["end_iso"],
+                    "base_revision": (
+                        None if r["base_revision"] is None else int(r["base_revision"])
+                    ),
+                    "registered_at": r["registered_at"],
+                }
+                for r in rows
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # 通行许可复核：实际占用中未被许可覆盖的时段
+    # ------------------------------------------------------------------
+
+    def query_permit_review(self, trip_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """复核车次在一组危险区内的实际占用是否被通行许可覆盖。
+
+        - 输入：车次、非空互异危险区 ID 集合、带时区 UTC 半开查询时段，
+          可选区域修订号、轨迹版本与许可修订号；
+        - 区域配置、车次有效点集与许可状态从**同一已提交读视图**读取；
+          未指定的版本取该读视图中的最新状态（无许可时许可修订号为 0）；
+        - 占用沿用既有轨迹插值、带洞边界与区域 UTC 半开生效规则；
+          仅对实际占用核对该车次该区的许可，重叠许可时段取并集；
+        - 按区返回无许可的正时长区间与累计秒数，并回填实际使用的
+          区域修订号、轨迹版本与许可修订号；无占用返回空区间与零秒数。
+        """
+        if not isinstance(trip_id, str) or not trip_id.strip():
+            raise ValidationError("trip_id 必须是非空字符串")
+        trip_id = trip_id.strip()
+
+        zone_ids_raw = payload.get("zone_ids")
+        if not isinstance(zone_ids_raw, list) or not zone_ids_raw:
+            raise ValidationError("zone_ids 必须是非空危险区 ID 列表")
+        zone_ids: List[str] = []
+        for idx, zid in enumerate(zone_ids_raw):
+            if not isinstance(zid, str) or not zid.strip():
+                raise ValidationError(f"zone_ids[{idx}] 必须是非空字符串")
+            zid = zid.strip()
+            if zid in zone_ids:
+                raise ValidationError(f"zone_ids 中危险区重复: {zid!r}（各危险区必须互异）")
+            zone_ids.append(zid)
+
+        try:
+            lo = parse_utc(payload.get("since"), field="since").timestamp()
+            hi = parse_utc(payload.get("until"), field="until").timestamp()
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if lo >= hi:
+            raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
+
+        pinned_rev = payload.get("revision") is not None
+        revision = (
+            _validate_revision_param(payload.get("revision")) if pinned_rev else None
+        )
+
+        pinned_track = payload.get("track_version") is not None
+        track_version = (
+            self._validate_track_version_value(payload.get("track_version"))
+            if pinned_track
+            else None
+        )
+
+        pinned_permit = payload.get("permit_revision") is not None
+        permit_revision = (
+            _validate_permit_revision_param(payload.get("permit_revision"))
+            if pinned_permit
+            else None
+        )
+
+        # ---- 同一已提交读视图：区域配置 + 车次点集 + 许可状态一次快照读取 ----
+        with self.db.read_view() as conn:
+            if pinned_track:
+                baseline, head = self.db._trip_version_info(conn, trip_id)
+                self._check_track_version_range(trip_id, track_version, baseline, head)
+                points = self.db._list_trip_point_version_rows(conn, trip_id, track_version)
+                used_track = track_version
+            else:
+                vrow = self.db._trip_version_row(conn, trip_id)
+                points = self.db._list_trip_points(conn, trip_id)
+                if vrow is None and not points:
+                    raise NotFoundError(f"车次不存在（无轨迹数据）: {trip_id}")
+                used_track = 0 if vrow is None else int(vrow["version"])
+
+            if pinned_rev:
+                head_rev = self.db._current_revision(conn)
+                if revision > head_rev:
+                    raise NotFoundError(
+                        f"修订号 {revision} 超出当前范围：当前最新修订号为 {head_rev}"
+                        + ("（尚无任何区域登记）" if head_rev == 0 else "")
+                    )
+                used_revision = revision
+            else:
+                used_revision = self.db._current_revision(conn)
+
+            head_permit = self.db._current_permit_revision(conn)
+            if pinned_permit:
+                if permit_revision > head_permit:
+                    raise NotFoundError(
+                        f"许可修订号 {permit_revision} 超出当前范围："
+                        f"当前最新许可修订号为 {head_permit}"
+                        + ("（尚无任何许可登记）" if head_permit == 0 else "")
+                    )
+                used_permit_revision = permit_revision
+            else:
+                used_permit_revision = head_permit
+
+            # 逐区取截至修订号的最后配置（未指定取最新）；未知区/该版本尚未登记明确拒绝
+            zone_rows: Dict[str, Any] = {}
+            for zid in zone_ids:
+                if pinned_rev:
+                    zrow = self.db._zone_row_at(conn, zid, revision)
+                    if zrow is None:
+                        raise NotFoundError(
+                            f"修订号 {revision} 的配置中危险区尚未登记: {zid}"
+                        )
+                else:
+                    zrow = self.db._latest_zone_row(conn, zid)
+                    if zrow is None:
+                        raise NotFoundError(f"危险区不存在: {zid}")
+                zone_rows[zid] = zrow
+
+            # 各区：实际占用 − 该车次该区有效许可时段并集（同一快照数据，纯计算）
+            zone_results: List[Dict[str, Any]] = []
+            for zid in zone_ids:
+                occupancy = self._coverage_intervals(zone_rows[zid], points, lo, hi)
+                permit_rows = self.db._list_active_permit_rows_for(
+                    conn, trip_id, zid, used_permit_revision
+                )
+                # 重叠许可时段取并集（相接/重叠合并）
+                permit_windows = merge_windows(
+                    [(r["start_epoch"], r["end_epoch"]) for r in permit_rows]
+                )
+                uncovered = _subtract_time_intervals(occupancy, permit_windows)
+                uncovered = [
+                    (s, e) for s, e in uncovered if e - s > self.min_duration
+                ]
+                zone_results.append(
+                    {
+                        "zone_id": zid,
+                        "unpermitted_segments": [
+                            {
+                                "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                                "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                                "duration_sec": round(e - s, 6),
+                            }
+                            for s, e in uncovered
+                        ],
+                        "unpermitted_total_sec": round(
+                            sum(e - s for s, e in uncovered), 6
+                        ),
+                    }
+                )
+
+        return {
+            "trip_id": trip_id,
+            "since": _iso_z(datetime.fromtimestamp(lo, timezone.utc)),
+            "until": _iso_z(datetime.fromtimestamp(hi, timezone.utc)),
+            "zone_ids": list(zone_ids),
+            "point_count": len(points),
+            "zones": zone_results,
+            "revision": used_revision,
+            "track_version": used_track,
+            "permit_revision": used_permit_revision,
+        }

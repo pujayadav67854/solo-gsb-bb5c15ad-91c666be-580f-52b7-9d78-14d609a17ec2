@@ -10,7 +10,18 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import CoOccupancyQuery, CorrectionBatch, PointBatch, ProximityQuery, RiskBudgetQuery, SpeedingReviewQuery, ZoneCreate
+from .schemas import (
+    CoOccupancyQuery,
+    CorrectionBatch,
+    PermitCreate,
+    PermitReviewQuery,
+    PermitRevoke,
+    PointBatch,
+    ProximityQuery,
+    RiskBudgetQuery,
+    SpeedingReviewQuery,
+    ZoneCreate,
+)
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,7 +37,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
@@ -46,6 +57,11 @@ app = FastAPI(
         "点间隔超过上限的整段视为无覆盖，重叠区域按最低限速，"
         "返回按时序切分的超速正时长区间（每段速度、适用限速与并列限速区）、"
         "实际使用的版本号、违规总时长与超速距离总量。"
+        "危险区通行许可按许可 ID、车次、危险区与带时区 UTC 半开时段登记，"
+        "每次真实登记或撤销原子递增全局许可修订号并保留不可改历史；"
+        "同 ID 同内容重传幂等、异内容冲突、撤销后 ID 不得重用，撤销须提交所见许可修订号。"
+        "许可复核按同一已提交读视图核对实际占用是否被许可覆盖，"
+        "按区返回无许可的正时长区间、累计秒数及实际使用的区域修订号、轨迹版本与许可修订号。"
     ),
 )
 
@@ -92,6 +108,11 @@ def index() -> dict:
             "POST /api/v1/zones/{zone_id}/proximity",
             "POST /api/v1/trips/{trip_id}/risk-budget",
             "POST /api/v1/trips/{trip_id}/speeding-review",
+            "POST /api/v1/permits",
+            "POST /api/v1/permits/{permit_id}/revoke",
+            "GET  /api/v1/permits/{permit_id}",
+            "GET  /api/v1/permit-revisions",
+            "POST /api/v1/trips/{trip_id}/permit-review",
         ],
     }
 
@@ -264,6 +285,67 @@ def query_speeding_review(trip_id: str, body: SpeedingReviewQuery) -> dict:
     速度严格大于限速才违规；返回按时序切分的违规正时长区间（每段速度、适用限速与
     并列限速区 ID）、实际使用的区域修订号与轨迹版本，以及违规总时长与超速距离总量。"""
     return service.query_speeding_review(trip_id, body.model_dump())
+
+
+@app.post("/api/v1/permits")
+def create_permit(body: PermitCreate) -> JSONResponse:
+    """登记通行许可：许可 ID、车次、危险区与带时区 UTC 半开时段。
+
+    登记时危险区须存在（车次可尚无轨迹）；同 ID 同内容重传幂等（HTTP 200，不产生新
+    许可修订号），异内容冲突（409），已撤销 ID 不得重用（409）；每次真实登记原子
+    递增全局许可修订号（HTTP 201）并保留不可改历史。
+    """
+    result = service.register_permit(body.model_dump())
+    status_code = 201 if result["status"] == "created" else 200
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@app.post("/api/v1/permits/{permit_id}/revoke")
+def revoke_permit(permit_id: str, body: PermitRevoke) -> dict:
+    """撤销通行许可：须提交所见全局许可修订号；过期或重复撤销拒绝（409），
+    许可不存在 404；成功撤销原子递增全局许可修订号并保留不可改历史。"""
+    return service.revoke_permit(permit_id, body.model_dump())
+
+
+@app.get("/api/v1/permits/{permit_id}")
+def get_permit(
+    permit_id: str,
+    permit_revision: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description="可选许可修订号：返回该许可截至该号的状态；省略则返回当前状态",
+    ),
+) -> JSONResponse:
+    """查询单个许可的状态（有效/已撤销，含产生该状态的许可修订号）。"""
+    try:
+        detail = service.get_permit(permit_id, permit_revision)
+    except NotFoundError as exc:
+        return JSONResponse(
+            status_code=404, content={"error": "not_found", "detail": str(exc)}
+        )
+    if detail is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found", "detail": f"许可不存在: {permit_id}"},
+        )
+    return JSONResponse(content=detail)
+
+
+@app.get("/api/v1/permit-revisions")
+def list_permit_revisions(
+    limit: int = Query(default=500, ge=1, le=10000, description="最多返回条数（按修订号倒序）"),
+) -> dict:
+    """全局许可修订流水：每次真实登记/撤销产生一条（含当前最新许可修订号）。"""
+    return service.list_permit_revisions(limit=limit)
+
+
+@app.post("/api/v1/trips/{trip_id}/permit-review")
+def query_permit_review(trip_id: str, body: PermitReviewQuery) -> dict:
+    """通行许可复核：区域配置、车次有效点集与许可状态从同一已提交读视图读取，
+    沿用轨迹插值、带洞边界与区域生效规则，仅对实际占用核对该车次该区许可
+    （重叠许可时段取并集）；按区返回无许可的正时长区间与累计秒数，
+    并回填实际使用的区域修订号、轨迹版本与许可修订号。"""
+    return service.query_permit_review(trip_id, body.model_dump())
 
 
 if __name__ == "__main__":

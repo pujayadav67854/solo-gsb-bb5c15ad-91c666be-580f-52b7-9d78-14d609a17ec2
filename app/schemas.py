@@ -188,3 +188,50 @@ class ProximityQuery(BaseModel):
         default_factory=dict,
         description="可选逐车轨迹版本 {trip_id: 版本号}；未列出的车次取查询时最新已提交状态",
     )
+
+
+class PermitCreate(BaseModel):
+    """通行许可登记：许可 ID、车次、危险区与带时区 UTC 半开时段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    permit_id: str = Field(..., min_length=1, description="许可 ID（撤销后不得重用）")
+    trip_id: str = Field(..., min_length=1, description="车次（登记时可尚无轨迹）")
+    zone_id: str = Field(..., min_length=1, description="危险区 ID（登记时必须已存在）")
+    start: str = Field(..., description="许可生效起始 UTC ISO 8601（含），必须带时区")
+    end: str = Field(..., description="许可生效结束 UTC ISO 8601（不含），必须带时区")
+
+
+class PermitRevoke(BaseModel):
+    """通行许可撤销：须提交作业人员所见的全局许可修订号（乐观并发）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_revision: int = Field(
+        ..., ge=1, description="撤销方所见的当前全局许可修订号；不一致按过期拒绝"
+    )
+
+
+class PermitReviewQuery(BaseModel):
+    """通行许可复核请求：实际占用中未被许可覆盖的时段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    zone_ids: List[str] = Field(
+        ..., min_length=1, description="非空且互异的危险区 ID 集合（重复在服务层拒绝）"
+    )
+    since: str = Field(..., description="查询起始 UTC ISO 8601（含），必须带时区")
+    until: str = Field(..., description="查询结束 UTC ISO 8601（不含），必须带时区")
+    revision: Optional[int] = Field(
+        default=None, ge=1, description="可选区域修订号：按截至该号的区域配置核算"
+    )
+    track_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="可选轨迹版本号：按该版本保留的有效点集核算",
+    )
+    permit_revision: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="可选许可修订号：按截至该号的许可状态核算（复现补办/撤销前结果）",
+    )
