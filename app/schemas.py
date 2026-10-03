@@ -188,3 +188,58 @@ class ProximityQuery(BaseModel):
         default_factory=dict,
         description="可选逐车轨迹版本 {trip_id: 版本号}；未列出的车次取查询时最新已提交状态",
     )
+
+
+class PermitCreate(BaseModel):
+    """作业车进入危险区通行许可登记请求：许可 ID + 车次 + 危险区 + UTC 半开覆盖时段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    permit_id: str = Field(..., min_length=1, description="许可 ID；撤销后永久占用、不得重用")
+    trip_id: str = Field(..., min_length=1, description="车次；登记时可尚无轨迹")
+    zone_id: str = Field(..., min_length=1, description="危险区 ID；登记时该区须已存在")
+    start: str = Field(..., description="许可覆盖起始 UTC ISO 8601（含），必须带时区")
+    end: str = Field(..., description="许可覆盖结束 UTC ISO 8601（不含），必须带时区")
+
+
+class PermitRevoke(BaseModel):
+    """通行许可撤销请求：须提交所见全局许可修订号（乐观并发）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    revision: int = Field(
+        ...,
+        ge=0,
+        description="提交方所见的当前全局许可修订号；过期（已前进）或重复撤销拒绝",
+    )
+    reason: Optional[str] = Field(
+        default=None, description="可选撤销原因（仅记录用途，不影响修订语义）"
+    )
+
+
+class PermitReviewQuery(BaseModel):
+    """单车次多危险区通行许可复核请求：核对实际占用是否被许可覆盖。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    zone_ids: List[Annotated[str, Field(min_length=1)]] = Field(
+        ..., min_length=1, description="非空且互异的危险区 ID 集合（重复在服务层拒绝）"
+    )
+    since: str = Field(..., description="查询起始 UTC ISO 8601（含），必须带时区")
+    until: str = Field(..., description="查询结束 UTC ISO 8601（不含），必须带时区")
+    revision: Optional[int] = Field(
+        default=None, ge=1, description="可选区域修订号：按截至该号的区域配置核算实际占用"
+    )
+    track_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="可选轨迹版本号：按该版本保留的有效点集核算，响应回填实际使用版本",
+    )
+    permit_revision: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "可选全局许可修订号（含 0）：按截至该号的许可状态复现；"
+            "省略取同一读视图最新号，无任何许可时为 0"
+        ),
+    )

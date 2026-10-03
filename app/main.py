@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import CoOccupancyQuery, CorrectionBatch, PointBatch, ProximityQuery, RiskBudgetQuery, SpeedingReviewQuery, ZoneCreate
+from .schemas import CoOccupancyQuery, CorrectionBatch, PermitCreate, PermitReviewQuery, PermitRevoke, PointBatch, ProximityQuery, RiskBudgetQuery, SpeedingReviewQuery, ZoneCreate
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,7 +26,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
@@ -46,6 +46,13 @@ app = FastAPI(
         "点间隔超过上限的整段视为无覆盖，重叠区域按最低限速，"
         "返回按时序切分的超速正时长区间（每段速度、适用限速与并列限速区）、"
         "实际使用的版本号、违规总时长与超速距离总量。"
+        "作业车进入危险区前须登记覆盖实际占用时段的通行许可：许可按许可 ID、车次、"
+        "危险区及带时区 UTC 半开时段登记（登记时危险区须存在，车次可尚无轨迹），"
+        "同 ID 同内容重传幂等、异内容冲突，撤销后 ID 不得重用；每次真实登记或撤销"
+        "原子递增独立的全局许可修订号并保留不可改历史，撤销须提交所见修订号，"
+        "过期或重复撤销拒绝。许可复核按同一已提交读视图（可选区域修订号、轨迹版本、"
+        "许可修订号；无许可时许可修订号为 0）核对单车次在各区的实际占用，"
+        "重叠许可时段取并集，按区返回无许可的正时长区间、累计秒数与实际使用的三个版本。"
     ),
 )
 
@@ -92,6 +99,11 @@ def index() -> dict:
             "POST /api/v1/zones/{zone_id}/proximity",
             "POST /api/v1/trips/{trip_id}/risk-budget",
             "POST /api/v1/trips/{trip_id}/speeding-review",
+            "POST /api/v1/permits",
+            "POST /api/v1/permits/{permit_id}/revoke",
+            "GET  /api/v1/permits/{permit_id}",
+            "GET  /api/v1/permit-revisions",
+            "POST /api/v1/trips/{trip_id}/permit-review",
         ],
     }
 
@@ -264,6 +276,53 @@ def query_speeding_review(trip_id: str, body: SpeedingReviewQuery) -> dict:
     速度严格大于限速才违规；返回按时序切分的违规正时长区间（每段速度、适用限速与
     并列限速区 ID）、实际使用的区域修订号与轨迹版本，以及违规总时长与超速距离总量。"""
     return service.query_speeding_review(trip_id, body.model_dump())
+
+
+@app.post("/api/v1/permits", status_code=201)
+def register_permit(body: PermitCreate) -> JSONResponse:
+    """通行许可登记：许可 ID + 车次 + 危险区 + UTC 半开覆盖时段。
+
+    登记时危险区须存在（车次可尚无轨迹）；同 ID 同内容重传幂等（200，不递增），
+    同 ID 异内容或撤销后 ID 重用冲突（409）；真实登记原子分配全局许可修订号（201）。
+    """
+    status_code, result = service.register_permit(body.model_dump())
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@app.post("/api/v1/permits/{permit_id}/revoke")
+def revoke_permit(permit_id: str, body: PermitRevoke) -> dict:
+    """撤销通行许可：须提交所见全局许可修订号；过期或重复撤销拒绝（409），
+    ID 未登记 404；真实撤销原子递增全局许可修订号，撤销后 ID 不得重用。"""
+    return service.revoke_permit(permit_id, body.model_dump())
+
+
+@app.get("/api/v1/permits/{permit_id}")
+def get_permit(permit_id: str) -> JSONResponse:
+    """查询单个许可当前状态（含已撤销）及其所在全局许可修订号。"""
+    detail = service.get_permit(permit_id)
+    if detail is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found", "detail": f"通行许可不存在（未登记）: {permit_id}"},
+        )
+    return JSONResponse(content=detail)
+
+
+@app.get("/api/v1/permit-revisions")
+def list_permit_revisions(
+    limit: int = Query(default=500, ge=1, le=10000, description="最多返回条数（按修订号倒序）"),
+) -> dict:
+    """全局通行许可修订流水：每次真实登记/撤销产生一条，含当前全局许可修订号。"""
+    return service.list_permit_revisions(limit=limit)
+
+
+@app.post("/api/v1/trips/{trip_id}/permit-review")
+def query_permit_review(trip_id: str, body: PermitReviewQuery) -> dict:
+    """单车次多危险区通行许可复核：区域配置、车次点集与许可状态从同一已提交读视图读取；
+    沿用既有轨迹插值、带洞边界与区域生效规则核算实际占用，仅核对该车次该区在指定
+    许可修订视图下仍有效的许可（重叠时段取并集）；按区返回无许可正时长区间、累计秒数
+    与实际使用的区域修订号、轨迹版本、许可修订号（无许可时为 0）。"""
+    return service.query_permit_review(trip_id, body.model_dump())
 
 
 if __name__ == "__main__":

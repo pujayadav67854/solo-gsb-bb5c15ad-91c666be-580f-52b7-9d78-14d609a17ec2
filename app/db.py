@@ -21,6 +21,16 @@
   版本与点集登记为最早可追溯基线（cause=baseline），不推造更早轨迹。穿越查询可按任一已保留
   版本复现当时点集。
 
+通行许可（作业车进入危险区）
+----------------------------
+- 作业车进入危险区前须取得覆盖实际占用时段的通行许可；许可按许可 ID、车次、危险区及
+  带时区 UTC 半开时段登记（登记时危险区须存在，车次可尚无轨迹）。
+- ``permits`` 为每个 permit_id 一行的当前状态（active/revoked）；``permit_revisions`` 为
+  只追加、不可改的全局许可修订流水：每次**真实**登记或撤销在同一写事务内分配一个全局递增
+  许可修订号（与区域修订号相互独立），同 ID 同内容幂等重传不产生行、不递增。
+- 撤销采用乐观许可修订号（提交所见修订号）：过期（全局已前进）或重复撤销（已撤销/ID 未登记）
+  一律拒绝；撤销后 permit_id 永久占用、不得重用。按许可修订号复核时，取截至该号的许可状态。
+
 并发
 ----
 - 服务进程内以一把可重入锁串行化对共享连接的访问；写事务使用 ``BEGIN IMMEDIATE``，
@@ -129,6 +139,44 @@ CREATE TABLE IF NOT EXISTS trip_point_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_trip_point_versions_lookup
     ON trip_point_versions(trip_id, version, ts_epoch, point_id);
+
+-- 通行许可当前状态表：每个 permit_id 一行（撤销即把 status 置为 revoked 并记录撤销修订号）。
+-- permit_id 一旦使用（登记或撤销）即永久占用：撤销后不得重用。
+CREATE TABLE IF NOT EXISTS permits (
+    permit_id        TEXT PRIMARY KEY,
+    trip_id          TEXT NOT NULL,
+    zone_id          TEXT NOT NULL,
+    start_epoch      REAL NOT NULL,          -- 许可覆盖时段起（含，UTC epoch 秒）
+    end_epoch        REAL NOT NULL,          -- 许可覆盖时段止（不含）
+    start_iso        TEXT NOT NULL,
+    end_iso          TEXT NOT NULL,
+    status           TEXT NOT NULL,          -- active | revoked
+    revision         INTEGER NOT NULL,       -- 最近一次真实变更（登记/撤销）的全局许可修订号
+    revoked_revision INTEGER,                -- 撤销时的全局许可修订号；未撤销为 NULL
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_permits_trip_zone
+    ON permits(trip_id, zone_id);
+
+-- 通行许可不可变修订历史：每次**真实**登记或撤销原子追加一行并分配全局递增许可修订号。
+-- 同 ID 同内容幂等重传不产生行；行只追加、永不修改、不删除，足以按修订号复原许可状态。
+CREATE TABLE IF NOT EXISTS permit_revisions (
+    revision   INTEGER PRIMARY KEY AUTOINCREMENT,  -- 全局递增许可修订号（独立于区域修订号）
+    permit_id  TEXT NOT NULL,
+    trip_id    TEXT NOT NULL,
+    zone_id    TEXT NOT NULL,
+    action     TEXT NOT NULL,          -- register | revoke
+    start_epoch REAL,                  -- revoke 时为 NULL
+    end_epoch   REAL,
+    start_iso   TEXT,
+    end_iso     TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_permit_revisions_permit
+    ON permit_revisions(permit_id, revision);
+CREATE INDEX IF NOT EXISTS idx_permit_revisions_trip_zone_rev
+    ON permit_revisions(trip_id, zone_id, revision);
 """
 
 _LEGACY_TABLES = ("zones", "zone_windows")
@@ -650,6 +698,136 @@ class Database:
             )
         )
 
+    # ----- 通行许可 --------------------------------------------------------
+
+    @staticmethod
+    def _current_permit_revision(conn: sqlite3.Connection) -> int:
+        """在给定连接/读视图内取当前全局许可修订号（尚无任何登记/撤销时为 0）。"""
+        cur = conn.execute("SELECT COALESCE(MAX(revision), 0) AS r FROM permit_revisions")
+        return int(cur.fetchone()["r"])
+
+    def current_permit_revision(self) -> int:
+        with self._lock:
+            return self._current_permit_revision(self._conn)
+
+    @staticmethod
+    def _permit_row(conn: sqlite3.Connection, permit_id: str) -> Optional[sqlite3.Row]:
+        cur = conn.execute("SELECT * FROM permits WHERE permit_id = ?", (permit_id,))
+        return cur.fetchone()
+
+    @staticmethod
+    def _insert_permit(
+        conn: sqlite3.Connection,
+        permit_id: str,
+        trip_id: str,
+        zone_id: str,
+        start_epoch: float,
+        end_epoch: float,
+        start_iso: str,
+        end_iso: str,
+        revision: int,
+        now_iso: str,
+    ) -> None:
+        """登记事务内写入新许可当前状态（active）。"""
+        conn.execute(
+            "INSERT INTO permits"
+            "(permit_id, trip_id, zone_id, start_epoch, end_epoch, start_iso, end_iso, "
+            " status, revision, revoked_revision, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?, 'active', ?, NULL, ?, ?)",
+            (
+                permit_id, trip_id, zone_id, start_epoch, end_epoch, start_iso, end_iso,
+                revision, now_iso, now_iso,
+            ),
+        )
+
+    @staticmethod
+    def _revoke_permit(conn: sqlite3.Connection, permit_id: str, revision: int, now_iso: str) -> None:
+        """撤销事务内把许可置为 revoked（permit_id 永久占用，行保留）。"""
+        conn.execute(
+            "UPDATE permits SET status='revoked', revision=?, revoked_revision=?, "
+            "updated_at=? WHERE permit_id=?",
+            (revision, revision, now_iso, permit_id),
+        )
+
+    @staticmethod
+    def _insert_permit_revision(
+        conn: sqlite3.Connection,
+        permit_id: str,
+        trip_id: str,
+        zone_id: str,
+        action: str,
+        start_epoch: Optional[float],
+        end_epoch: Optional[float],
+        start_iso: Optional[str],
+        end_iso: Optional[str],
+        now_iso: str,
+    ) -> int:
+        """在给定写事务内追加一条不可变许可修订记录，返回全局许可修订号。"""
+        cur = conn.execute(
+            "INSERT INTO permit_revisions"
+            "(permit_id, trip_id, zone_id, action, start_epoch, end_epoch, "
+            " start_iso, end_iso, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                permit_id, trip_id, zone_id, action,
+                start_epoch, end_epoch, start_iso, end_iso, now_iso,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    @staticmethod
+    def _permit_ledger_rows(
+        conn: sqlite3.Connection, trip_id: str, zone_id: str
+    ) -> List[sqlite3.Row]:
+        """某车次某危险区的全部许可修订流水（按修订号升序）。"""
+        return list(
+            conn.execute(
+                "SELECT * FROM permit_revisions WHERE trip_id = ? AND zone_id = ? "
+                "ORDER BY revision",
+                (trip_id, zone_id),
+            )
+        )
+
+    @staticmethod
+    def _active_permit_windows_at(
+        conn: sqlite3.Connection,
+        trip_id: str,
+        zone_id: str,
+        revision: Optional[int],
+    ) -> List[Tuple[float, float]]:
+        """从不可变流水重放某车次某危险区在指定许可修订视图下仍有效的许可时段。
+
+        按修订号顺序重放 register/revoke：register 加入，revoke 移除。
+        这样撤销后的许可在其撤销修订号之前的旧视图中仍可见（历史可复现）；
+        revision=None 时重放全部流水，结果与当前状态表一致。
+        """
+        active: Dict[str, Tuple[float, float]] = {}
+        for r in Database._permit_ledger_rows(conn, trip_id, zone_id):
+            if revision is not None and int(r["revision"]) > revision:
+                break
+            if r["action"] == "register":
+                active[r["permit_id"]] = (r["start_epoch"], r["end_epoch"])
+            else:
+                active.pop(r["permit_id"], None)
+        return list(active.values())
+
+    @staticmethod
+    def _list_permit_revision_rows(
+        conn: sqlite3.Connection, limit: Optional[int] = None
+    ) -> List[sqlite3.Row]:
+        if limit is None:
+            return list(
+                conn.execute(
+                    "SELECT * FROM permit_revisions ORDER BY revision"
+                )
+            )
+        return list(
+            conn.execute(
+                "SELECT * FROM permit_revisions ORDER BY revision DESC LIMIT ?",
+                (int(limit),),
+            )
+        )
+
     def clear_all_for_tests(self) -> None:
         """测试专用：清空业务数据并重置修订号序列。"""
         with self.transaction() as conn:
@@ -660,5 +838,8 @@ class Database:
             conn.execute("DELETE FROM point_corrections")
             conn.execute("DELETE FROM trip_version_log")
             conn.execute("DELETE FROM trip_point_versions")
+            conn.execute("DELETE FROM permits")
+            conn.execute("DELETE FROM permit_revisions")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='zone_revisions'")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='point_corrections'")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='permit_revisions'")

@@ -62,3 +62,31 @@ def clip_intervals_halfopen(
             if hi > lo:
                 out.append((lo, hi))
     return out
+
+
+def subtract_intervals_halfopen(
+    intervals: List[Tuple[float, float]],
+    covers: List[Tuple[float, float]],
+    eps: float = 1e-9,
+) -> List[Tuple[float, float]]:
+    """从一组左闭右开区间 intervals 中减去 covers 覆盖的部分（扫描线）。
+
+    两端均为左闭右开，仅端点接触不产生覆盖（[a,b) 减去 [b,c) 仍为整段）；
+    输出合并后的左闭右开正时长区间。intervals/covers 内部可重叠，先各自合并。
+    """
+    base = merge_windows(intervals)
+    cuts = merge_windows(covers)
+    out: List[Tuple[float, float]] = []
+    for a, b in base:
+        cur = a
+        for c, d in cuts:
+            if d <= cur + eps or c >= b - eps:
+                continue  # 与当前剩余段不相交（含仅端点接触）
+            if c > cur:
+                out.append((cur, min(b, c)))
+            cur = max(cur, d)
+            if cur >= b - eps:
+                break
+        if cur < b - eps:
+            out.append((cur, b))
+    return [(s, e) for s, e in merge_windows(out) if e - s > eps]
